@@ -1,9 +1,5 @@
 # P2P File Sharing System — Python
 
-A BitTorrent-inspired peer-to-peer file sharing system written entirely in Python 3.
-Inspired by the original Java implementation at [SaiPande/P2PFileSharing](https://github.com/SaiPande/P2PFileSharing).
-
----
 
 ## Features
 
