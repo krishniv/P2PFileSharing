@@ -3,11 +3,6 @@
 ## Overview
 This project implements a decentralized Peer-to-Peer (P2P) File Sharing System, drawing inspiration from BitTorrent. It enables multiple peers to exchange file segments over TCP connections, with features like peer prioritization and dynamic choking/unchoking to optimize performance and fairness.
 
-## Key Features
-- **Fully decentralized architecture** utilizing TCP sockets for communication.
-- **Choking and unchoking algorithms** to manage bandwidth and prioritize peers based on activity.
-- **File chunking** to allow concurrent downloads from multiple peers.
-- **Extensive logging** to monitor system events and support debugging.
 
 ## Getting Started
 
@@ -45,14 +40,12 @@ Lists all peers with their connection details and initial file ownership:
 1003 localhost 6005 0
 ```
 
-## Core Components
+## Core Components to be Implemented
 
 - **`update_preferred_neighbors()`**: Dynamically selects preferred neighbors based on their download contribution.
 - **`optimistically_unchoke_neighbor()`**: Randomly selects one additional peer to unchoke, promoting fairness.
 - **`merge_file_pieces()`**: Reassembles the original file after all pieces are received.
 
-## Conclusion
-This project effectively simulates a scalable and fair file-sharing network. By integrating bitfield tracking and dynamic peer prioritization, it showcases key principles behind modern distributed file-sharing protocols.
 
 ## Team Members
 **Group 11**
