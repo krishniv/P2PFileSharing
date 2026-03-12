@@ -1,29 +1,3 @@
-"""
-peer.py
--------
-Main peer node for the BitTorrent-inspired P2P file sharing system.
-
-Usage
------
-    python peer.py <peerID>
-
-    Example (three terminals):
-        python peer.py 1001   # seeder  — place the target file in peer_1001/
-        python peer.py 1002   # leecher
-        python peer.py 1003   # leecher
-
-Configuration is read from:
-    Common.cfg   — global parameters (preferred neighbours, intervals, file info)
-    PeerInfo.cfg — list of all peers with their IDs, hostnames, ports and file flags
-
-Concurrency model
------------------
-    • One daemon thread runs the TCP server (accept loop).
-    • Each accepted / outbound connection gets its own PeerConnectionHandler thread.
-    • Two daemon threads run the periodic choke / optimistic-unchoke algorithms.
-    • One daemon thread polls for global download completion.
-    • An RLock protects shared mutable state (bitfield, maps, sets, flag).
-"""
 
 import math
 import os
@@ -36,7 +10,7 @@ import time
 
 from logger import Logger
 from peer_configuration import PeerConfiguration
-from peer_connection_handler import PeerConnectionHandler
+# from peer_connection_handler import PeerConnectionHandler
 
 # ---------------------------------------------------------------------------
 # Config file names (resolved relative to cwd at runtime)
@@ -69,20 +43,6 @@ def _repeat(func, interval: float) -> threading.Thread:
 # ---------------------------------------------------------------------------
 
 class Peer:
-    """
-    Central coordinator for one peer node.
-
-    Key responsibilities
-    --------------------
-    1. Parse Common.cfg and PeerInfo.cfg.
-    2. Start a TCP server socket on the configured port.
-    3. Connect outbound to all peers with a lower ID (avoids duplicate connections).
-    4. Exchange the 32-byte handshake with every peer.
-    5. Maintain the bitfield (which pieces we own).
-    6. Run the periodic preferred-neighbour selection (tit-for-tat choke/unchoke).
-    7. Detect when the file is fully downloaded and merge pieces.
-    8. Exit when every peer in the network has the complete file.
-    """
 
     def __init__(self, peer_id: str):
         self.peer_id         = str(peer_id)
@@ -108,12 +68,10 @@ class Peer:
         self.bitfield:           bytearray = None
         self._has_complete_file: bool      = False
 
-        self.neighbor_sockets:   dict = {}   # peer_id → socket
-        self.client_handlers:    dict = {}   # peer_id → PeerConnectionHandler
-        self.peer_completion_map: dict = {}  # peer_id → bool
 
         self.preferred_neighbors:           set = set()
         self.optimistic_unchoked_neighbor:  int = -1
+            # Removed redundant attributes related to PeerConnectionHandler and completion tracking
 
         # Reentrant lock: guards all mutable shared fields above
         self._lock          = threading.RLock()
@@ -222,13 +180,9 @@ class Peer:
         self._connect_to_peers()
 
         # Periodic scheduling
-        _repeat(self._update_preferred_neighbors, self.unchoking_interval)
-        _repeat(self._optimistically_unchoke_neighbor, self.optimistic_unchoking_interval)
 
         # Background completion watcher
-        threading.Thread(
-            target=self._watch_completion, daemon=True, name="completion-watcher"
-        ).start()
+            # Removed redundant scheduling and completion watcher
 
     # ======================================================================
     # Configuration parsing
@@ -329,10 +283,6 @@ class Peer:
             )
             with self._lock:
                 self.neighbor_sockets[remote_id] = conn
-                handler = PeerConnectionHandler(conn, remote_id, self)
-                self.client_handlers[remote_id]  = handler
-                self.peer_completion_map[remote_id] = False
-            handler.start()
         except (IOError, OSError) as exc:
             print(f"[{self.peer_id}] Error on inbound connection: {exc}", file=sys.stderr)
 
@@ -351,10 +301,6 @@ class Peer:
                 )
                 with self._lock:
                     self.neighbor_sockets[pid] = s
-                    handler = PeerConnectionHandler(s, pid, self)
-                    self.client_handlers[pid]  = handler
-                    self.peer_completion_map[pid] = False
-                handler.start()
             except (IOError, OSError) as exc:
                 print(f"[{self.peer_id}] Cannot connect to peer {pid}: {exc}", file=sys.stderr)
 
@@ -449,43 +395,12 @@ class Peer:
         except Exception as exc:
             print(f"[{self.peer_id}] Error in _update_preferred_neighbors: {exc}", file=sys.stderr)
 
-    def _optimistically_unchoke_neighbor(self) -> None:
-        """
-        Randomly pick one choked interested peer outside the preferred set and
-        unchoke it to give it a fair chance to prove its download speed.
-        Runs every *optimistic_unchoking_interval* seconds.
-        """
-        try:
-            with self._lock:
-                handlers  = dict(self.client_handlers)
-                preferred = set(self.preferred_neighbors)
 
-            candidates = [
-                h for h in handlers.values()
-                if h.is_choked()
-                and h.is_interested()
-                and h.get_remote_peer_id() not in preferred
-            ]
 
-            if not candidates:
-                return
 
-            chosen = random.choice(candidates)
-            with self._lock:
-                self.optimistic_unchoked_neighbor = chosen.get_remote_peer_id()
 
-            chosen.send_unchoke()
-            self.logger.create_log(
-                f"Peer [{self.peer_id}] optimistically unchoked "
-                f"[{chosen.get_remote_peer_id()}]."
-            )
-            self._log_all_neighbour_states(handlers)
 
-        except Exception as exc:
-            print(
-                f"[{self.peer_id}] Error in _optimistically_unchoke_neighbor: {exc}",
-                file=sys.stderr,
-            )
+            # Removed redundant unchoke logic
 
     def _log_all_neighbour_states(self, handlers: dict) -> None:
         lines = [f"Peer [{self.peer_id}] neighbour states:"]
@@ -590,7 +505,6 @@ def main() -> None:
     peer = Peer(sys.argv[1])
     peer.start()
 
-    # Keep the main thread alive; all real work happens in daemon threads
     try:
         while True:
             time.sleep(1)
