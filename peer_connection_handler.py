@@ -1,353 +1,265 @@
-"""
-peer_connection_handler.py
---------------------------
-Manages full-duplex communication with ONE remote peer over a TCP socket.
-
-Each instance runs as its own daemon thread (started by Peer).
-It handles every incoming message and generates the appropriate outgoing
-response, while also being called externally to send CHOKE / UNCHOKE / HAVE
-messages driven by the Peer's scheduling logic.
-
-State diagram (from this peer's perspective)
---------------------------------------------
-  choked    = True   → remote peer cannot download from us
-  interested = False → we don't want pieces from the remote peer
-  After UNCHOKE arrives → choked = False → we immediately try to request a piece
-  After PIECE arrives  → update bitfield, announce HAVE to all, try next piece
-"""
-
+import threading
+import struct
+import math
 import os
 import random
-import struct
-import threading
-
-from message import Message
-from p2p_messages import P2PMessages
-
+from message import Message, P2PMessages
 
 class PeerConnectionHandler(threading.Thread):
-    """One thread per active peer connection."""
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
-
-    def __init__(self, connection, remote_peer_id: int, peer):
-        super().__init__(daemon=True)
-        self.socket         = connection
+    def __init__(self, sock, remote_peer_id, peer):
+        super().__init__()
+        self.sock = sock
         self.remote_peer_id = remote_peer_id
-        self.peer           = peer          # back-reference to the Peer instance
-
-        # Choking / interest state
-        self.choked    = True    # default: remote cannot request from us
-        self.interested = False  # default: we don't yet know if we want remote's pieces
-
-        # Remote peer's bitfield (which pieces it owns)
-        bitfield_bytes = -(-peer.total_pieces // 8)   # ceil(total_pieces / 8)
-        self.remote_bitfield = bytearray(bitfield_bytes)
-
-        # Download-rate tracking (reset each unchoking interval)
-        self._rate_lock          = threading.Lock()
+        self.peer = peer
+        self.choked = True
+        self.interested = False
+        
+        bf_size = math.ceil(peer.get_total_pieces() / 8)
+        self.remote_peers_bitfield = bytearray(bf_size)
+        
         self.track_download_rate = 0
-        self.pieces_downloaded   = 0
+        self.pieces_downloaded = 0
         self.total_bytes_received = 0
+        self.marked_complete = False
 
-        # Prevent marking the remote peer complete more than once
-        self._marked_complete = False
-
-    # ------------------------------------------------------------------
-    # Thread entry point
-    # ------------------------------------------------------------------
-
-    def run(self) -> None:
+    def run(self):
         try:
-            # Send our own bitfield right after handshake
-            self._send_bitfield()
-
-            # Main receive loop — runs until socket is closed
+            if self.peer.get_bitfield() is not None:
+                self.send_bitfield()
+                
             while True:
-                msg = Message.receive(self.socket)
-                self._dispatch(msg)
-
-        except (IOError, OSError):
-            self.peer.logger.create_log(
-                f"Peer [{self.peer.peer_id}] connection closed with [{self.remote_peer_id}]."
-            )
+                message = Message.receive_p2p_bittorrent_messages(self.sock)
+                self.handle_message(message)
+                
+        except Exception as e:
+            self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] connection closed with [{self.remote_peer_id}].")
             self.peer.remove_client_handler(self.remote_peer_id)
 
-    # ------------------------------------------------------------------
-    # Outgoing messages (public — called from Peer's scheduler threads)
-    # ------------------------------------------------------------------
+    def send_bitfield(self):
+        bitfield = self.peer.get_bitfield()
+        if bitfield is not None:
+            msg = Message(P2PMessages.BITFIELD, bytes(bitfield))
+            msg.send_message(self.sock)
+            self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] sent BITFIELD message to [{self.remote_peer_id}].")
 
-    def send_choke(self) -> None:
-        """Instruct the remote peer to stop requesting pieces from us."""
-        Message(P2PMessages.CHOKE).send_message(self.socket)
-        self.choked = True
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] is choking [{self.remote_peer_id}]."
-        )
-        self._log_status()
-
-    def send_unchoke(self) -> None:
-        """Allow the remote peer to request pieces from us again."""
-        Message(P2PMessages.UNCHOKE).send_message(self.socket)
-        self.choked = False
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] is unchoking [{self.remote_peer_id}]."
-        )
-        self._log_status()
-        self._request_piece()   # Immediately take advantage of being unchoked
-
-    def send_have(self, piece_index: int) -> None:
-        """Broadcast to this peer that we just downloaded piece *piece_index*."""
-        payload = struct.pack(">I", piece_index)
-        Message(P2PMessages.HAVE, payload).send_message(self.socket)
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] sent HAVE[{piece_index}] to [{self.remote_peer_id}]."
-        )
-
-    # ------------------------------------------------------------------
-    # Accessors used by Peer's scheduling / selection logic
-    # ------------------------------------------------------------------
-
-    def is_interested(self) -> bool:
-        return self.interested
-
-    def is_choked(self) -> bool:
-        return self.choked
-
-    def get_remote_peer_id(self) -> int:
-        return self.remote_peer_id
-
-    def get_track_download_rate(self) -> int:
-        """Return pieces-downloaded count since last call, then reset it to zero."""
-        with self._rate_lock:
-            rate = self.track_download_rate
-            self.track_download_rate = 0
-        return rate
-
-    # ------------------------------------------------------------------
-    # Message dispatcher
-    # ------------------------------------------------------------------
-
-    def _dispatch(self, msg: Message) -> None:
-        t = msg.get_type()
-        if   t == P2PMessages.BITFIELD:      self._on_bitfield(msg.get_payload())
-        elif t == P2PMessages.INTERESTED:    self._on_interested()
-        elif t == P2PMessages.NOT_INTERESTED: self._on_not_interested()
-        elif t == P2PMessages.REQUEST:       self._on_request(msg.get_payload())
-        elif t == P2PMessages.PIECE:         self._on_piece(msg.get_payload())
-        elif t == P2PMessages.HAVE:          self._on_have(msg.get_payload())
-        elif t == P2PMessages.CHOKE:         self._on_choke()
-        elif t == P2PMessages.UNCHOKE:       self._on_unchoke()
+    def handle_message(self, message):
+        msg_type = message.get_type()
+        payload = message.get_payload()
+        
+        if msg_type == P2PMessages.BITFIELD:
+            self.process_received_bitfield(payload)
+        elif msg_type == P2PMessages.INTERESTED:
+            self.handle_interested_message()
+        elif msg_type == P2PMessages.NOT_INTERESTED:
+            self.handle_not_interested_message()
+        elif msg_type == P2PMessages.REQUEST:
+            self.handle_request_message(payload)
+        elif msg_type == P2PMessages.PIECE:
+            self.handle_piece_message(payload)
+        elif msg_type == P2PMessages.HAVE:
+            self.handle_have_message(payload)
+        elif msg_type == P2PMessages.CHOKE:
+            self.handle_choke_message()
+        elif msg_type == P2PMessages.UNCHOKE:
+            self.handle_unchoke_message()
         else:
-            print(f"[{self.peer.peer_id}] Unknown message type from {self.remote_peer_id}")
+            print(f"Unknown message type received from peer {self.remote_peer_id}")
 
-    # ------------------------------------------------------------------
-    # Incoming message handlers
-    # ------------------------------------------------------------------
-
-    def _on_bitfield(self, payload: bytes) -> None:
-        """Store the remote peer's bitfield and send INTERESTED / NOT_INTERESTED."""
-        self.remote_bitfield[:len(payload)] = payload
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] received BITFIELD from [{self.remote_peer_id}]."
-        )
-
-        # Are we interested in any piece the remote has that we lack?
-        want = any(
-            not self.peer.has_piece(i) and self._remote_has(i)
-            for i in range(self.peer.total_pieces)
-        )
-        if want:
-            self._send_interested()
+    def process_received_bitfield(self, payload):
+        self.remote_peers_bitfield[:] = payload
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] received the BITFIELD message from [{self.remote_peer_id}].")
+        
+        is_interested = False
+        for i in range(self.peer.get_total_pieces()):
+            if not self.peer.has_piece(i) and self.has_piece(i):
+                is_interested = True
+                break
+                
+        if is_interested:
+            self.send_interested()
             self.interested = True
         else:
-            self._send_not_interested()
+            self.send_not_interested()
             self.interested = False
-
-        # If the remote already has every piece, mark it complete immediately
-        if self._remote_piece_count() == self.peer.total_pieces:
+            
+        if self.get_remote_peers_piece_count() == self.peer.get_total_pieces():
             self.peer.mark_peer_complete(self.remote_peer_id)
+            
+        self.log_peer_status_summary()
 
-        self._log_status()
-
-    def _on_interested(self) -> None:
+    def handle_interested_message(self):
         self.interested = True
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] received INTERESTED from [{self.remote_peer_id}]."
-        )
-        self._log_status()
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] received the 'interested' message from [{self.remote_peer_id}].")
+        self.log_peer_status_summary()
 
-    def _on_not_interested(self) -> None:
+    def handle_not_interested_message(self):
         self.interested = False
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] received NOT_INTERESTED from [{self.remote_peer_id}]."
-        )
-        self._log_status()
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] received the 'not interested' message from [{self.remote_peer_id}].")
+        self.log_peer_status_summary()
 
-    def _on_request(self, payload: bytes) -> None:
-        """Send the requested piece if we have it and the peer is unchoked."""
-        piece_index = struct.unpack(">I", payload)[0]
-        if not self.choked and self.peer.has_piece(piece_index):
-            self._send_piece(piece_index)
-            self.peer.logger.create_log(
-                f"Peer [{self.peer.peer_id}] sent piece [{piece_index}] to [{self.remote_peer_id}]."
-            )
-
-    def _on_piece(self, payload: bytes) -> None:
-        """Save received piece, update bookkeeping, propagate HAVE, request next piece."""
+    def handle_request_message(self, payload):
         piece_index = struct.unpack(">I", payload[:4])[0]
-        piece_data  = payload[4:]
+        if not self.choked and self.peer.has_piece(piece_index):
+            self.send_piece(piece_index)
+            self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] sent piece [{piece_index}] to [{self.remote_peer_id}].")
 
-        # Persist to disk
-        self._save_piece(piece_index, piece_data)
-
-        # Update this peer's bitfield and check for completion
+    def handle_piece_message(self, payload):
+        piece_index = struct.unpack(">I", payload[:4])[0]
+        piece_data = payload[4:]
+        
+        self.save_piece(piece_index, piece_data)
         self.peer.update_bitfield(piece_index)
         self.peer.check_and_set_completion()
-
-        # Advertise to all other handlers that we now own this piece
+        
         for handler in self.peer.get_client_handlers():
             handler.send_have(piece_index)
+            
+        self.pieces_downloaded += 1
+        self.track_download_rate += 1
+        self.total_bytes_received += len(piece_data)
+        
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] has downloaded the piece [{piece_index}] from [{self.remote_peer_id}]. Now the number of pieces it has is [{self.get_number_of_pieces()}].")
+        self.peer.get_logger().create_log(f"Total bytes received so far: {self.total_bytes_received} bytes.")
+        
+        self.request_piece()
 
-        # Update rate counters
-        with self._rate_lock:
-            self.pieces_downloaded    += 1
-            self.track_download_rate  += 1
-            self.total_bytes_received += len(piece_data)
-
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] downloaded piece [{piece_index}] from "
-            f"[{self.remote_peer_id}]. Have {self._local_piece_count()} / "
-            f"{self.peer.total_pieces} pieces."
-        )
-        self.peer.logger.create_log(
-            f"Total bytes received from [{self.remote_peer_id}]: "
-            f"{self.total_bytes_received} bytes."
-        )
-
-        # Immediately try to fetch the next needed piece
-        self._request_piece()
-
-    def _on_have(self, payload: bytes) -> None:
-        """Update the remote bitfield and express interest if the new piece is useful."""
-        piece_index = struct.unpack(">I", payload)[0]
-        self._set_remote_has(piece_index)
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] received HAVE[{piece_index}] from [{self.remote_peer_id}]."
-        )
-
+    def handle_have_message(self, payload):
+        piece_index = struct.unpack(">I", payload[:4])[0]
+        self.set_piece_available(piece_index)
+        
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] received the 'have' message from [{self.remote_peer_id}] for the piece [{piece_index}].")
+        
         if not self.peer.has_piece(piece_index):
-            self._send_interested()
+            self.send_interested()
             self.interested = True
-
-        # Check again whether the remote now has a full copy
-        if self._remote_piece_count() == self.peer.total_pieces:
+            
+        if self.get_remote_peers_piece_count() == self.peer.get_total_pieces():
             self.peer.mark_peer_complete(self.remote_peer_id)
+            
+        self.log_peer_status_summary()
 
-        self._log_status()
+    def get_remote_peers_piece_count(self):
+        count = 0
+        for i in range(self.peer.get_total_pieces()):
+            if self.has_piece(i):
+                count += 1
+        return count
 
-    def _on_choke(self) -> None:
+    def handle_choke_message(self):
         self.choked = True
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] was choked by [{self.remote_peer_id}]."
-        )
-        self._log_status()
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] is choked by [{self.remote_peer_id}].")
+        self.log_peer_status_summary()
 
-    def _on_unchoke(self) -> None:
+    def handle_unchoke_message(self):
         self.choked = False
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] was unchoked by [{self.remote_peer_id}]."
-        )
-        self._log_status()
-        self._request_piece()
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] is unchoked by [{self.remote_peer_id}].")
+        self.log_peer_status_summary()
+        self.request_piece()
 
-    # ------------------------------------------------------------------
-    # Private send helpers
-    # ------------------------------------------------------------------
+    def send_interested(self):
+        msg = Message(P2PMessages.INTERESTED)
+        msg.send_message(self.sock)
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] sent INTERESTED message to [{self.remote_peer_id}].")
 
-    def _send_bitfield(self) -> None:
-        bf = self.peer.get_bitfield()
-        if bf:
-            Message(P2PMessages.BITFIELD, bf).send_message(self.socket)
-            self.peer.logger.create_log(
-                f"Peer [{self.peer.peer_id}] sent BITFIELD to [{self.remote_peer_id}]."
-            )
+    def send_not_interested(self):
+        msg = Message(P2PMessages.NOT_INTERESTED)
+        msg.send_message(self.sock)
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] sent NOT INTERESTED message to [{self.remote_peer_id}].")
 
-    def _send_interested(self) -> None:
-        Message(P2PMessages.INTERESTED).send_message(self.socket)
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] sent INTERESTED to [{self.remote_peer_id}]."
-        )
+    def send_have(self, piece_index):
+        payload = struct.pack(">I", piece_index)
+        msg = Message(P2PMessages.HAVE, payload)
+        msg.send_message(self.sock)
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] sent HAVE message for piece [{piece_index}] to [{self.remote_peer_id}].")
 
-    def _send_not_interested(self) -> None:
-        Message(P2PMessages.NOT_INTERESTED).send_message(self.socket)
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] sent NOT_INTERESTED to [{self.remote_peer_id}]."
-        )
+    def send_choke(self):
+        msg = Message(P2PMessages.CHOKE)
+        msg.send_message(self.sock)
+        self.choked = True
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] is choking [{self.remote_peer_id}].")
+        self.log_peer_status_summary()
 
-    def _send_piece(self, piece_index: int) -> None:
-        piece_path = os.path.join(self.peer.peer_directory, f"piece_{piece_index}")
+    def send_unchoke(self):
+        msg = Message(P2PMessages.UNCHOKE)
+        msg.send_message(self.sock)
+        self.choked = False
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] is unchoking [{self.remote_peer_id}].")
+        self.log_peer_status_summary()
+        self.request_piece()
+
+    def send_piece(self, piece_index):
+        piece_path = os.path.join(self.peer.get_peer_directory(), f"piece_{piece_index}")
         with open(piece_path, "rb") as f:
-            data = f.read()
-        payload = struct.pack(">I", piece_index) + data
-        Message(P2PMessages.PIECE, payload).send_message(self.socket)
+            piece_data = f.read()
+            
+        payload = struct.pack(">I", piece_index) + piece_data
+        msg = Message(P2PMessages.PIECE, payload)
+        msg.send_message(self.sock)
 
-    def _request_piece(self) -> None:
-        """Pick a random piece we need from the remote and send a REQUEST."""
+    def request_piece(self):
         if self.choked:
             return
-        missing = [
-            i for i in range(self.peer.total_pieces)
-            if not self.peer.has_piece(i) and self._remote_has(i)
-        ]
-        if not missing:
-            self._send_not_interested()
+            
+        missing_pieces = []
+        for i in range(self.peer.get_total_pieces()):
+            if not self.peer.has_piece(i) and self.has_piece(i):
+                missing_pieces.append(i)
+                
+        if not missing_pieces:
+            self.send_not_interested()
             self.interested = False
             return
-        choice = random.choice(missing)
-        Message(P2PMessages.REQUEST, struct.pack(">I", choice)).send_message(self.socket)
-        self.peer.logger.create_log(
-            f"Peer [{self.peer.peer_id}] sent REQUEST[{choice}] to [{self.remote_peer_id}]."
-        )
+            
+        piece_index = random.choice(missing_pieces)
+        payload = struct.pack(">I", piece_index)
+        msg = Message(P2PMessages.REQUEST, payload)
+        msg.send_message(self.sock)
+        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] sent REQUEST for piece [{piece_index}] to [{self.remote_peer_id}].")
 
-    # ------------------------------------------------------------------
-    # Disk I/O
-    # ------------------------------------------------------------------
+    def save_piece(self, piece_index, piece_data):
+        piece_path = os.path.join(self.peer.get_peer_directory(), f"piece_{piece_index}")
+        with open(piece_path, "wb") as f:
+            f.write(piece_data)
 
-    def _save_piece(self, piece_index: int, data: bytes) -> None:
-        path = os.path.join(self.peer.peer_directory, f"piece_{piece_index}")
-        with open(path, "wb") as f:
-            f.write(data)
+    def has_piece(self, index):
+        byte_index = index // 8
+        bit_index = 7 - (index % 8)
+        if byte_index >= len(self.remote_peers_bitfield):
+            return False
+        return (self.remote_peers_bitfield[byte_index] & (1 << bit_index)) != 0
 
-    # ------------------------------------------------------------------
-    # Remote bitfield helpers
-    # ------------------------------------------------------------------
+    def set_piece_available(self, index):
+        byte_index = index // 8
+        bit_index = 7 - (index % 8)
+        if byte_index < len(self.remote_peers_bitfield):
+            self.remote_peers_bitfield[byte_index] |= (1 << bit_index)
 
-    def _remote_has(self, index: int) -> bool:
-        byte_i = index // 8
-        bit_i  = 7 - (index % 8)
-        return bool(self.remote_bitfield[byte_i] & (1 << bit_i))
+    def is_interested(self):
+        return self.interested
 
-    def _set_remote_has(self, index: int) -> None:
-        byte_i = index // 8
-        bit_i  = 7 - (index % 8)
-        self.remote_bitfield[byte_i] |= (1 << bit_i)
+    def is_choked(self):
+        return self.choked
 
-    def _remote_piece_count(self) -> int:
-        return sum(1 for i in range(self.peer.total_pieces) if self._remote_has(i))
+    def get_remote_peer_id(self):
+        return self.remote_peer_id
 
-    def _local_piece_count(self) -> int:
-        return sum(1 for i in range(self.peer.total_pieces) if self.peer.has_piece(i))
+    def get_track_download_rate(self):
+        rate = self.track_download_rate
+        self.track_download_rate = 0
+        return rate
 
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
+    def get_number_of_pieces(self):
+        count = 0
+        for i in range(self.peer.get_total_pieces()):
+            if self.peer.has_piece(i):
+                count += 1
+        return count
 
-    def _log_status(self) -> None:
-        self.peer.logger.create_log(
-            f"  Neighbor [{self.remote_peer_id}]: "
-            f"{'Choked' if self.choked else 'Unchoked'} | "
-            f"{'Interested' if self.interested else 'Not Interested'}"
-        )
+    def has_complete_file(self):
+        return self.peer.has_complete_file()
+
+    def log_peer_status_summary(self):
+        choked_str = "Choked" if self.choked else "Unchoked"
+        interested_str = "Interested" if self.interested else "Not Interested"
+        status = f"Neighbor [{self.remote_peer_id}]: {choked_str}, {interested_str}"
+        self.peer.get_logger().create_log(status)
