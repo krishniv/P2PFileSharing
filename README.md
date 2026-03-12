@@ -1,190 +1,63 @@
-# P2P File Sharing System — Python
+# Peer-to-Peer File Sharing System
 
+## Overview
+This project implements a decentralized Peer-to-Peer (P2P) File Sharing System, drawing inspiration from BitTorrent. It enables multiple peers to exchange file segments over TCP connections, with features like peer prioritization and dynamic choking/unchoking to optimize performance and fairness.
 
-## Features
+## Key Features
+- **Fully decentralized architecture** utilizing TCP sockets for communication.
+- **Choking and unchoking algorithms** to manage bandwidth and prioritize peers based on activity.
+- **File chunking** to allow concurrent downloads from multiple peers.
+- **Extensive logging** to monitor system events and support debugging.
 
-| Feature | Details |
-|---------|---------|
-| Protocol | Custom BitTorrent-style over TCP |
-| Piece transfer | Fixed-size chunks (configurable) |
-| Peer selection | Tit-for-tat choke / unchoke |
-| Fairness | Optimistic unchoking every N seconds |
-| Concurrency | One thread per peer connection |
-| Logging | Timestamped file + stdout logs |
-| Dependencies | **Python 3 standard library only** — no pip installs needed |
+## Getting Started
 
----
+### Requirements
+- Python 3.8+ 
+- No external libraries required (uses only built-in modules).
 
-## Project Structure
-
-```
-P2PFileSharing_Python/
-├── peer.py                    # Main peer node & entry point
-├── peer_connection_handler.py # Per-connection message handler (one thread each)
-├── message.py                 # Wire-format serialisation / deserialisation
-├── p2p_messages.py            # Enum of all 8 message types
-├── peer_configuration.py      # Data class for a single peer's config
-├── logger.py                  # Thread-safe timestamped logger
-├── Common.cfg                 # Global parameters (intervals, file info)
-├── PeerInfo.cfg               # Network topology (peer IDs, hosts, ports)
-├── peer_1001/                 # Data directory for peer 1001
-├── peer_1002/                 # Data directory for peer 1002
-└── peer_1003/                 # Data directory for peer 1003
-```
-
----
-
-## Quick Start
-
-### 1. Place the shared file
-
-Copy the file you want to distribute into the **seeder's** directory:
-
+### Running the Application
+Start each peer with its assigned ID from the configuration file. For example:
 ```bash
-cp /path/to/tree.jpg  peer_1001/tree.jpg
-```
-
-> The seeder is the peer whose fourth column in `PeerInfo.cfg` is `1`.
-
-### 2. Edit configuration (if needed)
-
-**`Common.cfg`**
-
-```
-NumberOfPreferredNeighbors 3       # K peers to unchoke at a time
-UnchokingInterval 5                # Seconds between neighbour recalculations
-OptimisticUnchokingInterval 10     # Seconds between optimistic unchokes
-FileName tree.jpg                  # File to share
-FileSize 24301568                  # File size in bytes
-PieceSize 1638400                  # ~1.6 MB per piece
-```
-
-**`PeerInfo.cfg`** — one line per peer:
-
-```
-<PeerID>  <Hostname>  <Port>  <HasFile(1/0)>
-
-1001 localhost 6003 1    ← seeder (has the file)
-1002 localhost 6004 0    ← leecher
-1003 localhost 6005 0    ← leecher
-```
-
-### 3. Run (start seeder first, then leechers)
-
-Open three separate terminals **from the `P2PFileSharing_Python/` directory**:
-
-```bash
-# Terminal 1 — seeder
 python peer.py 1001
-
-# Terminal 2 — leecher
 python peer.py 1002
-
-# Terminal 3 — leecher
 python peer.py 1003
 ```
 
-Each peer exits automatically once every peer in the network has the complete file.
 
----
+## Configuration Files
 
-## Protocol Details
-
-### Handshake (32 bytes)
-
+### `Common.cfg`
+Defines the global settings for the P2P system:
 ```
-[18 bytes] b'P2PFILESHARINGPROJ'   ← fixed magic header
-[10 bytes] 0x00 × 10               ← reserved / padding
-[ 4 bytes] peer_id (uint32 BE)     ← sender's numeric ID
-```
-
-### Message Wire Format
-
-```
-[4 bytes] length (uint32 BE)  ← 1 + len(payload)
-[1 byte ] type                ← one of 0-7 (see table below)
-[N bytes] payload             ← optional, type-dependent
+NumberOfPreferredNeighbors 3
+UnchokingInterval 5
+OptimisticUnchokingInterval 10
+FileName tree.jpg
+FileSize 24301568
+PieceSize 1638400
 ```
 
-### Message Types
-
-| Type | ID | Payload | Description |
-|------|----|---------|-------------|
-| CHOKE | 0 | — | Stop sending requests to the sender |
-| UNCHOKE | 1 | — | You may resume sending requests |
-| INTERESTED | 2 | — | I want pieces you have |
-| NOT_INTERESTED | 3 | — | I don't need any of your pieces right now |
-| HAVE | 4 | `uint32` piece index | I just downloaded this piece |
-| BITFIELD | 5 | bitmask bytes | My current piece ownership map |
-| REQUEST | 6 | `uint32` piece index | Please send me this piece |
-| PIECE | 7 | `uint32` index + raw data | Here is the piece data |
-
----
-
-## Algorithms
-
-### Preferred-Neighbour Selection (every `UnchokingInterval` seconds)
-
+### `PeerInfo.cfg`
+Lists all peers with their connection details and initial file ownership:
 ```
-if seeder:
-    shuffle interested peers, pick top K  # fair random rotation
-else:
-    sort interested peers by download rate, pick top K  # tit-for-tat
-
-Send UNCHOKE to selected, CHOKE to the rest.
+1001 localhost 6003 1
+1002 localhost 6004 0
+1003 localhost 6005 0
 ```
 
-### Optimistic Unchoking (every `OptimisticUnchokingInterval` seconds)
+## Core Components
 
-```
-Pick one random choked+interested peer outside the preferred set.
-Send UNCHOKE to it.
+- **`update_preferred_neighbors()`**: Dynamically selects preferred neighbors based on their download contribution.
+- **`optimistically_unchoke_neighbor()`**: Randomly selects one additional peer to unchoke, promoting fairness.
+- **`merge_file_pieces()`**: Reassembles the original file after all pieces are received.
 
-Purpose: let new / slow peers prove themselves; prevent starvation.
-```
+## Conclusion
+This project effectively simulates a scalable and fair file-sharing network. By integrating bitfield tracking and dynamic peer prioritization, it showcases key principles behind modern distributed file-sharing protocols.
 
-### Piece Selection
+## Team Members
+**Group 11**
+- Satvik LNU - 49893400
+- Krishna Niveditha Sudeep Kumar -  63557608
+- Bhumi jain - 73961370
+  
 
-Random selection from `{pieces remote has} ∩ {pieces we lack}`.
-Prevents all peers from racing for the same piece simultaneously.
-
----
-
-## Log Files
-
-Each peer writes to its own log file (also mirrored to stdout):
-
-```
-log_peer_1001.log
-log_peer_1002.log
-log_peer_1003.log
-```
-
-Sample log line:
-```
-[Thu Mar 06 14:22:01 2026]: Peer [1002] downloaded piece [3] from [1001]. Have 1 / 15 pieces.
-```
-
----
-
-## Adding More Peers
-
-1. Add a new line to `PeerInfo.cfg`:
-   ```
-   1004 localhost 6006 0
-   ```
-2. Create the directory:
-   ```bash
-   mkdir peer_1004
-   ```
-3. Run:
-   ```bash
-   python peer.py 1004
-   ```
-
----
-
-## Requirements
-
-- **Python 3.8+**
-- No external packages — uses only the Python standard library.
