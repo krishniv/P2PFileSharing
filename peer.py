@@ -1,602 +1,412 @@
-"""
-peer.py
--------
-Main peer node for the BitTorrent-inspired P2P file sharing system.
-
-Usage
------
-    python peer.py <peerID>
-
-    Example (three terminals):
-        python peer.py 1001   # seeder  — place the target file in peer_1001/
-        python peer.py 1002   # leecher
-        python peer.py 1003   # leecher
-
-Configuration is read from:
-    Common.cfg   — global parameters (preferred neighbours, intervals, file info)
-    PeerInfo.cfg — list of all peers with their IDs, hostnames, ports and file flags
-
-Concurrency model
------------------
-    • One daemon thread runs the TCP server (accept loop).
-    • Each accepted / outbound connection gets its own PeerConnectionHandler thread.
-    • Two daemon threads run the periodic choke / optimistic-unchoke algorithms.
-    • One daemon thread polls for global download completion.
-    • An RLock protects shared mutable state (bitfield, maps, sets, flag).
-"""
-
-import math
+import sys
 import os
-import random
+import threading
 import socket
 import struct
-import sys
-import threading
 import time
-
+import math
+import random
+from peer_config import PeerConfiguration
 from logger import Logger
-from peer_configuration import PeerConfiguration
 from peer_connection_handler import PeerConnectionHandler
 
-# ---------------------------------------------------------------------------
-# Config file names (resolved relative to cwd at runtime)
-# ---------------------------------------------------------------------------
-COMMON_CONFIG   = "Common.cfg"
+COMMON_CONFIG = "Common.cfg"
 PEER_INFO_CONFIG = "PeerInfo.cfg"
 
-
-# ---------------------------------------------------------------------------
-# Helper: repeating daemon timer
-# ---------------------------------------------------------------------------
-
-def _repeat(func, interval: float) -> threading.Thread:
-    """Call *func* every *interval* seconds in a daemon thread (initial delay = interval)."""
-    def _loop():
-        time.sleep(interval)
-        while True:
-            try:
-                func()
-            except Exception as exc:
-                print(f"[scheduler] Error in {func.__name__}: {exc}", file=sys.stderr)
-            time.sleep(interval)
-    t = threading.Thread(target=_loop, daemon=True, name=f"scheduler-{func.__name__}")
-    t.start()
-    return t
-
-
-# ---------------------------------------------------------------------------
-# Peer
-# ---------------------------------------------------------------------------
-
 class Peer:
-    """
-    Central coordinator for one peer node.
+    def __init__(self, peer_id):
+        self.peer_id = str(peer_id)
+        self.working_directory = os.getcwd()
+        self.peer_directory = os.path.join(self.working_directory, f"peer_{self.peer_id}")
+        self.logger = Logger(f"log_peer_{self.peer_id}.log")
+        
+        self.host_name = ""
+        self.port = 0
+        self.peer_has_file = False
+        
+        self.peer_completion_map = {}
+        self.peers_info = {}
+        self.neighbor_sockets = {}
+        self.client_handlers = {}
+        self.preferred_neighbors = set()
+        self.optimistic_unchoked_neighbor = -1
+        
+        self.bitfield = None
+        self.file_name = ""
+        self.file_size = 0
+        self.total_pieces = 0
+        self.piece_size = 0
+        
+        self._has_complete_file = False
+        self.completion_lock = threading.Lock()
+        self.bitfield_lock = threading.Lock()
+        
+        self.number_of_preferred_neighbors = 0
+        self.unchoking_interval = 0
+        self.optimistic_unchoking_interval = 0
 
-    Key responsibilities
-    --------------------
-    1. Parse Common.cfg and PeerInfo.cfg.
-    2. Start a TCP server socket on the configured port.
-    3. Connect outbound to all peers with a lower ID (avoids duplicate connections).
-    4. Exchange the 32-byte handshake with every peer.
-    5. Maintain the bitfield (which pieces we own).
-    6. Run the periodic preferred-neighbour selection (tit-for-tat choke/unchoke).
-    7. Detect when the file is fully downloaded and merge pieces.
-    8. Exit when every peer in the network has the complete file.
-    """
-
-    def __init__(self, peer_id: str):
-        self.peer_id         = str(peer_id)
-        self.peer_directory  = os.path.join(os.getcwd(), f"peer_{peer_id}")
-        self.logger          = Logger(f"log_peer_{peer_id}.log")
-
-        # Populated by _parse_common_config()
-        self.file_name:                   str = None
-        self.file_size:                   int = None
-        self.piece_size:                  int = None
-        self.total_pieces:                int = None
-        self.number_of_preferred_neighbors: int = None
-        self.unchoking_interval:          int = None
-        self.optimistic_unchoking_interval: int = None
-
-        # Populated by _parse_peer_info_config()
-        self.host_name:     str  = None
-        self.port:          int  = None
-        self.peer_has_file: bool = False
-        self.peers_info:    dict = {}   # peer_id(int) → PeerConfiguration
-
-        # Runtime state — all guarded by _lock
-        self.bitfield:           bytearray = None
-        self._has_complete_file: bool      = False
-
-        self.neighbor_sockets:   dict = {}   # peer_id → socket
-        self.client_handlers:    dict = {}   # peer_id → PeerConnectionHandler
-        self.peer_completion_map: dict = {}  # peer_id → bool
-
-        self.preferred_neighbors:           set = set()
-        self.optimistic_unchoked_neighbor:  int = -1
-
-        # Reentrant lock: guards all mutable shared fields above
-        self._lock          = threading.RLock()
-        self._server_socket: socket.socket = None
-        self._server_ready  = threading.Event()
-
-    # ======================================================================
-    # Public interface (called by PeerConnectionHandler and the scheduler)
-    # ======================================================================
-
-    def get_bitfield(self) -> bytes:
-        """Return a snapshot of the current bitfield (thread-safe copy)."""
-        with self._lock:
-            return bytes(self.bitfield) if self.bitfield is not None else None
-
-    def has_piece(self, piece_index: int) -> bool:
-        """True if we currently own piece *piece_index*."""
-        with self._lock:
-            byte_i = piece_index // 8
-            bit_i  = piece_index % 8
-            return bool(self.bitfield[byte_i] & (1 << (7 - bit_i)))
-
-    def update_bitfield(self, piece_index: int) -> None:
-        """Mark piece *piece_index* as owned in our bitfield."""
-        with self._lock:
-            byte_i = piece_index // 8
-            bit_i  = piece_index % 8
-            self.bitfield[byte_i] |= (1 << (7 - bit_i))
-
-    def has_complete_file(self) -> bool:
-        with self._lock:
+    def get_peer_directory(self):
+        return self.peer_directory
+        
+    def get_file_name(self):
+        return self.file_name
+        
+    def get_piece_size(self):
+        return self.piece_size
+        
+    def get_total_pieces(self):
+        return self.total_pieces
+        
+    def get_logger(self):
+        return self.logger
+        
+    def get_peer_id(self):
+        return self.peer_id
+        
+    def has_complete_file(self):
+        with self.completion_lock:
             return self._has_complete_file
+            
+    def get_client_handlers(self):
+        return list(self.client_handlers.values())
+        
+    def remove_client_handler(self, remote_peer_id):
+        if remote_peer_id in self.client_handlers:
+            del self.client_handlers[remote_peer_id]
+        if remote_peer_id in self.neighbor_sockets:
+            try:
+                self.neighbor_sockets[remote_peer_id].close()
+            except Exception:
+                pass
+            del self.neighbor_sockets[remote_peer_id]
 
-    def get_client_handlers(self) -> list:
-        """Return a snapshot list of all active PeerConnectionHandlers."""
-        with self._lock:
-            return list(self.client_handlers.values())
-
-    def remove_client_handler(self, remote_peer_id: int) -> None:
-        with self._lock:
-            self.client_handlers.pop(remote_peer_id, None)
-            self.neighbor_sockets.pop(remote_peer_id, None)
-
-    def mark_peer_complete(self, remote_peer_id: int) -> None:
-        """Called by a handler when it determines the remote peer has every piece."""
-        with self._lock:
-            self.peer_completion_map[remote_peer_id] = True
-        self.logger.create_log(
-            f"Peer [{self.peer_id}] marked peer [{remote_peer_id}] as complete."
-        )
-
-    def check_and_set_completion(self) -> None:
-        """After a new piece arrives, check if we now have everything and merge."""
-        with self._lock:
-            if not self._has_complete_file and self._all_pieces_owned():
-                self._has_complete_file = True
-                self.logger.create_log(
-                    f"Peer [{self.peer_id}] has downloaded the complete file."
-                )
-                try:
-                    self._merge_file_pieces()
-                except OSError as exc:
-                    print(f"Error merging file pieces: {exc}", file=sys.stderr)
-
-    # ======================================================================
-    # Start-up
-    # ======================================================================
-
-    def start(self) -> None:
-        """Parse configs, initialise state, start server + peer connections."""
-        self._parse_common_config()
-        self._parse_peer_info_config()
-
-        # Make sure the peer's working directory exists
-        os.makedirs(self.peer_directory, exist_ok=True)
-
-        # Compute total number of pieces (ceiling division)
-        self.total_pieces   = math.ceil(self.file_size / self.piece_size)
-        bitfield_bytes       = math.ceil(self.total_pieces / 8)
-        self.bitfield        = bytearray(bitfield_bytes)
-
+    def start(self):
+        self.process_common_config_file()
+        self.process_peer_info_config_file()
+        
+        if not os.path.exists(self.peer_directory):
+            os.makedirs(self.peer_directory)
+            
+        self.total_pieces = math.ceil(self.file_size / self.piece_size)
+        bf_size = math.ceil(self.total_pieces / 8)
+        self.bitfield = bytearray(bf_size)
+        
         if self.peer_has_file:
-            # Seeder: all bits set, split the file into pieces if not done yet
-            for i in range(bitfield_bytes):
-                self.bitfield[i] = 0xFF
-            with self._lock:
-                self._has_complete_file = True
-            src = os.path.join(self.peer_directory, self.file_name)
-            if not os.path.isfile(src):
-                raise FileNotFoundError(
-                    f"Seeder file not found: {src}\n"
-                    f"Place {self.file_name!r} inside {self.peer_directory!r} before starting."
-                )
-            self._split_file_into_pieces(src)
-        else:
-            # Leecher: no pieces yet
-            for i in range(bitfield_bytes):
-                self.bitfield[i] = 0x00
-
-        # Start listening for inbound connections
-        self._start_server()
-        # Block briefly until the socket is actually bound
-        self._server_ready.wait(timeout=5.0)
-
-        # Connect outbound to every peer with a lower ID
-        self._connect_to_peers()
-
-        # Periodic scheduling
-        _repeat(self._update_preferred_neighbors, self.unchoking_interval)
-        _repeat(self._optimistically_unchoke_neighbor, self.optimistic_unchoking_interval)
-
-        # Background completion watcher
-        threading.Thread(
-            target=self._watch_completion, daemon=True, name="completion-watcher"
-        ).start()
-
-    # ======================================================================
-    # Configuration parsing
-    # ======================================================================
-
-    def _parse_common_config(self) -> None:
-        cfg = {}
-        with open(COMMON_CONFIG, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) == 2:
-                    cfg[parts[0]] = parts[1]
-
-        self.number_of_preferred_neighbors   = int(cfg["NumberOfPreferredNeighbors"])
-        self.unchoking_interval              = int(cfg["UnchokingInterval"])
-        self.optimistic_unchoking_interval   = int(cfg["OptimisticUnchokingInterval"])
-        self.file_name                        = cfg["FileName"]
-        self.file_size                        = int(cfg["FileSize"])
-        self.piece_size                       = int(cfg["PieceSize"])
-
-        self.logger.create_log(
-            f"Parsed {COMMON_CONFIG}: neighbors={self.number_of_preferred_neighbors}, "
-            f"unchoke_interval={self.unchoking_interval}s, "
-            f"opt_unchoke_interval={self.optimistic_unchoking_interval}s, "
-            f"file={self.file_name} ({self.file_size} bytes), "
-            f"piece_size={self.piece_size} bytes"
-        )
-
-    def _parse_peer_info_config(self) -> None:
-        self.logger.create_log(f"Parsing {PEER_INFO_CONFIG} ...")
-        found_self = False
-        with open(PEER_INFO_CONFIG, "r", encoding="utf-8") as f:
-            for line in f:
-                tokens = line.strip().split()
-                if not tokens:
-                    continue
-                pid          = int(tokens[0])
-                host_name    = tokens[1]
-                port         = int(tokens[2])
-                has_file     = tokens[3] == "1"
-                cfg          = PeerConfiguration(pid, host_name, port, has_file)
-                self.peers_info[pid] = cfg
-                self.logger.create_log(
-                    f"  Loaded peer: id={pid}, host={host_name}, port={port}, "
-                    f"has_file={has_file}"
-                )
-                if str(pid) == self.peer_id:
-                    self.host_name     = host_name
-                    self.port          = port
-                    self.peer_has_file = has_file
-                    found_self         = True
-
-        if not found_self:
-            raise ValueError(
-                f"Peer ID {self.peer_id!r} not found in {PEER_INFO_CONFIG}"
-            )
-        self.logger.create_log(
-            f"This peer: id={self.peer_id}, host={self.host_name}, "
-            f"port={self.port}, has_file={self.peer_has_file}"
-        )
-
-    # ======================================================================
-    # TCP networking
-    # ======================================================================
-
-    def _start_server(self) -> None:
-        """Bind the server socket and accept inbound connections in a daemon thread."""
-        def _accept_loop():
-            self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._server_socket.bind(("", self.port))
-            self._server_socket.listen(10)
-            self._server_ready.set()
-            self.logger.create_log(
-                f"Peer [{self.peer_id}] listening on port {self.port} ..."
-            )
-            while True:
-                try:
-                    conn, addr = self._server_socket.accept()
-                    threading.Thread(
-                        target=self._handle_inbound,
-                        args=(conn,),
-                        daemon=True,
-                        name=f"inbound-{addr}",
-                    ).start()
-                except OSError:
-                    break   # socket closed
-
-        threading.Thread(target=_accept_loop, daemon=True, name="server").start()
-
-    def _handle_inbound(self, conn: socket.socket) -> None:
-        """Perform handshake for an accepted connection, then start a handler thread."""
-        try:
-            remote_id_str = self._do_handshake(conn)
-            remote_id     = int(remote_id_str)
-            self.logger.create_log(
-                f"TCP connection: P{remote_id} → P{self.peer_id} (inbound)"
-            )
-            with self._lock:
-                self.neighbor_sockets[remote_id] = conn
-                handler = PeerConnectionHandler(conn, remote_id, self)
-                self.client_handlers[remote_id]  = handler
-                self.peer_completion_map[remote_id] = False
-            handler.start()
-        except (IOError, OSError) as exc:
-            print(f"[{self.peer_id}] Error on inbound connection: {exc}", file=sys.stderr)
-
-    def _connect_to_peers(self) -> None:
-        """Initiate outbound TCP connections to all peers listed before us in PeerInfo.cfg."""
-        for pid in sorted(self.peers_info.keys()):
-            if pid == int(self.peer_id):
-                break   # only connect to peers with lower IDs
-            cfg = self.peers_info[pid]
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((cfg.host_name, cfg.port_number))
-                self._do_handshake(s)
-                self.logger.create_log(
-                    f"TCP connection: P{self.peer_id} → P{pid} (outbound)"
-                )
-                with self._lock:
-                    self.neighbor_sockets[pid] = s
-                    handler = PeerConnectionHandler(s, pid, self)
-                    self.client_handlers[pid]  = handler
-                    self.peer_completion_map[pid] = False
-                handler.start()
-            except (IOError, OSError) as exc:
-                print(f"[{self.peer_id}] Cannot connect to peer {pid}: {exc}", file=sys.stderr)
-
-    def _do_handshake(self, sock: socket.socket) -> str:
-        """
-        Exchange the 32-byte handshake and return the remote peer's ID as a string.
-
-        Format
-        ------
-          [18 bytes] b'P2PFILESHARINGPROJ'
-          [10 bytes] 0x00 padding
-          [ 4 bytes] peer-id (big-endian uint32)
-        """
-        header  = b"P2PFILESHARINGPROJ"
-        padding = b"\x00" * 10
-        my_id   = struct.pack(">I", int(self.peer_id))
-        sock.sendall(header + padding + my_id)
-        self.logger.create_log(
-            f"Peer [{self.peer_id}] sent handshake."
-        )
-
-        buf = b""
-        while len(buf) < 32:
-            chunk = sock.recv(32 - len(buf))
-            if not chunk:
-                raise IOError("Connection closed during handshake")
-            buf += chunk
-
-        if buf[:18] != b"P2PFILESHARINGPROJ":
-            raise IOError(f"Bad handshake header: {buf[:18]!r}")
-
-        remote_id = struct.unpack(">I", buf[28:32])[0]
-        self.logger.create_log(
-            f"Peer [{self.peer_id}] received handshake from peer [{remote_id}]."
-        )
-        return str(remote_id)
-
-    # ======================================================================
-    # Choke / unchoke algorithm (BitTorrent tit-for-tat)
-    # ======================================================================
-
-    def _update_preferred_neighbors(self) -> None:
-        """
-        Select the top K preferred neighbours based on download contribution
-        (or randomly for seeders) and send CHOKE / UNCHOKE accordingly.
-        Runs every *unchoking_interval* seconds.
-        """
-        try:
-            with self._lock:
-                handlers  = dict(self.client_handlers)
-                has_file  = self._has_complete_file
-
-            interested = [h for h in handlers.values() if h.is_interested()]
-            if not interested:
-                with self._lock:
-                    self.preferred_neighbors.clear()
-                self.logger.create_log(
-                    f"Peer [{self.peer_id}] has no interested neighbours — nothing to do."
-                )
-                return
-
-            self.logger.create_log(
-                f"Peer [{self.peer_id}] recalculating preferred neighbours "
-                f"(interval={self.unchoking_interval}s) ..."
-            )
-
-            # Seeder → random rotation; Leecher → highest download rate wins
-            if has_file:
-                random.shuffle(interested)
-            else:
-                interested.sort(key=lambda h: h.get_track_download_rate(), reverse=True)
-
-            top_k   = set(h.get_remote_peer_id() for h in interested[: self.number_of_preferred_neighbors])
-
-            with self._lock:
-                self.preferred_neighbors = top_k
-
-            for h in handlers.values():
-                if h.get_remote_peer_id() in top_k:
-                    if h.is_choked():
-                        h.send_unchoke()
-                else:
-                    if not h.is_choked():
-                        h.send_choke()
-
-            self.logger.create_log(
-                f"Peer [{self.peer_id}] preferred neighbours: "
-                f"[{', '.join(str(p) for p in sorted(top_k))}]"
-            )
-            self._log_all_neighbour_states(handlers)
-
-        except Exception as exc:
-            print(f"[{self.peer_id}] Error in _update_preferred_neighbors: {exc}", file=sys.stderr)
-
-    def _optimistically_unchoke_neighbor(self) -> None:
-        """
-        Randomly pick one choked interested peer outside the preferred set and
-        unchoke it to give it a fair chance to prove its download speed.
-        Runs every *optimistic_unchoking_interval* seconds.
-        """
-        try:
-            with self._lock:
-                handlers  = dict(self.client_handlers)
-                preferred = set(self.preferred_neighbors)
-
-            candidates = [
-                h for h in handlers.values()
-                if h.is_choked()
-                and h.is_interested()
-                and h.get_remote_peer_id() not in preferred
-            ]
-
-            if not candidates:
-                return
-
-            chosen = random.choice(candidates)
-            with self._lock:
-                self.optimistic_unchoked_neighbor = chosen.get_remote_peer_id()
-
-            chosen.send_unchoke()
-            self.logger.create_log(
-                f"Peer [{self.peer_id}] optimistically unchoked "
-                f"[{chosen.get_remote_peer_id()}]."
-            )
-            self._log_all_neighbour_states(handlers)
-
-        except Exception as exc:
-            print(
-                f"[{self.peer_id}] Error in _optimistically_unchoke_neighbor: {exc}",
-                file=sys.stderr,
-            )
-
-    def _log_all_neighbour_states(self, handlers: dict) -> None:
-        lines = [f"Peer [{self.peer_id}] neighbour states:"]
-        for h in handlers.values():
-            lines.append(
-                f"  [{h.get_remote_peer_id()}] "
-                f"{'choked' if h.is_choked() else 'unchoked'} | "
-                f"{'interested' if h.is_interested() else 'not-interested'}"
-            )
-        self.logger.create_log("\n".join(lines))
-
-    # ======================================================================
-    # Completion detection
-    # ======================================================================
-
-    def _watch_completion(self) -> None:
-        """
-        Daemon thread: poll until every peer we know about has the complete file,
-        then call sys.exit(0).
-        """
-        while True:
-            try:
-                with self._lock:
-                    cmap      = dict(self.peer_completion_map)
-                    num_peers = len(self.peers_info)
-                    has_file  = self._has_complete_file
-
-                expected = num_peers - 1        # all others except ourselves
-
-                if len(cmap) < expected:
-                    self.logger.create_log(
-                        f"Peer [{self.peer_id}] waiting for connections "
-                        f"({len(cmap)}/{expected} known so far) ..."
-                    )
-                    time.sleep(2)
-                    continue
-
-                if has_file and all(cmap.values()):
-                    self.logger.create_log(
-                        f"Peer [{self.peer_id}]: all peers have the complete file. "
-                        f"Shutting down."
-                    )
-                    sys.exit(0)
-
-            except SystemExit:
-                raise
-            except Exception as exc:
-                print(f"[{self.peer_id}] Error in _watch_completion: {exc}", file=sys.stderr)
-
-            time.sleep(2)
-
-    # ======================================================================
-    # Bitfield helpers
-    # ======================================================================
-
-    def _all_pieces_owned(self) -> bool:
-        """True if every piece bit is set (caller must hold _lock or use RLock)."""
-        return all(self.has_piece(i) for i in range(self.total_pieces))
-
-    # ======================================================================
-    # File I/O
-    # ======================================================================
-
-    def _split_file_into_pieces(self, src_path: str) -> None:
-        """Split the source file into fixed-size piece files inside peer_directory."""
-        idx = 0
-        with open(src_path, "rb") as f:
-            while True:
-                chunk = f.read(self.piece_size)
-                if not chunk:
-                    break
-                dest = os.path.join(self.peer_directory, f"piece_{idx}")
-                with open(dest, "wb") as pf:
-                    pf.write(chunk)
-                idx += 1
-        self.logger.create_log(
-            f"Peer [{self.peer_id}] split {self.file_name!r} into {idx} pieces."
-        )
-
-    def _merge_file_pieces(self) -> None:
-        """Concatenate all piece files in order to reconstruct the original file."""
-        dest = os.path.join(self.peer_directory, self.file_name)
-        with open(dest, "wb") as out:
+            # set all valid bits in bitfield to 1
             for i in range(self.total_pieces):
-                piece_path = os.path.join(self.peer_directory, f"piece_{i}")
-                with open(piece_path, "rb") as pf:
-                    out.write(pf.read())
-        self.logger.create_log(
-            f"Peer [{self.peer_id}] merged pieces → {dest!r}"
-        )
+                byte_index = i // 8
+                bit_index = 7 - (i % 8)
+                self.bitfield[byte_index] |= (1 << bit_index)
+                
+            with self.completion_lock:
+                self._has_complete_file = True
+                
+            input_file_path = os.path.join(self.peer_directory, self.file_name)
+            if not os.path.exists(input_file_path):
+                print(f"File {self.file_name} not found in {self.peer_directory}")
+                
+            self.split_file_into_pieces(input_file_path)
+            
+        self.start_server()
+        self.connect_to_peers()
+        
+        threading.Thread(target=self.schedule_unchoking, daemon=True).start()
+        threading.Thread(target=self.schedule_optimistic_unchoking, daemon=True).start()
+        threading.Thread(target=self.check_completion, daemon=True).start()
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    if len(sys.argv) != 2:
-        print("Usage: python peer.py <peerID>", file=sys.stderr)
-        sys.exit(1)
-
-    peer = Peer(sys.argv[1])
-    peer.start()
-
-    # Keep the main thread alive; all real work happens in daemon threads
-    try:
+        # Prevent main thread from exiting immediately
         while True:
             time.sleep(1)
-    except KeyboardInterrupt:
-        print(f"\nPeer {sys.argv[1]} shutting down.")
 
+    def process_common_config_file(self):
+        with open(COMMON_CONFIG, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                parts = line.split()
+                key, val = parts[0], parts[1]
+                if key == "NumberOfPreferredNeighbors":
+                    self.number_of_preferred_neighbors = int(val)
+                elif key == "UnchokingInterval":
+                    self.unchoking_interval = int(val)
+                elif key == "OptimisticUnchokingInterval":
+                    self.optimistic_unchoking_interval = int(val)
+                elif key == "FileName":
+                    self.file_name = val
+                elif key == "FileSize":
+                    self.file_size = int(val)
+                elif key == "PieceSize":
+                    self.piece_size = int(val)
+                    
+        self.logger.create_log(f"Parsed Common.cfg: PreferredNeighbors={self.number_of_preferred_neighbors}, "
+                               f"UnchokingInterval={self.unchoking_interval}, "
+                               f"OptimisticUnchokingInterval={self.optimistic_unchoking_interval}, "
+                               f"FileName={self.file_name}, FileSize={self.file_size}, PieceSize={self.piece_size}")
+
+    def process_peer_info_config_file(self):
+        self.logger.create_log("Reading peer configuration from PeerInfo.cfg...")
+        found_self = False
+        with open(PEER_INFO_CONFIG, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                tokens = line.split()
+                peer_id = int(tokens[0])
+                hostname = tokens[1]
+                port = int(tokens[2])
+                has_file = (tokens[3] == "1")
+                
+                self.peers_info[peer_id] = PeerConfiguration(peer_id, hostname, port, has_file)
+                self.logger.create_log(f"Loaded peer: ID={peer_id}, Hostname={hostname}, Port={port}, HasFile={has_file}")
+                
+                if str(peer_id) == self.peer_id:
+                    self.host_name = hostname
+                    self.port = port
+                    self.peer_has_file = has_file
+                    found_self = True
+                    self.logger.create_log(f"This peer [{self.peer_id}] has Hostname={self.host_name}, Port={self.port}, HasFile={self.peer_has_file}")
+                    
+        if not found_self:
+            raise ValueError(f"Peer ID {self.peer_id} not found in PeerInfo.cfg")
+
+    def mark_peer_complete(self, remote_peer_id):
+        self.peer_completion_map[remote_peer_id] = True
+        self.logger.create_log(f"Peer [{self.peer_id}] marked Peer [{remote_peer_id}] as complete.")
+
+    def start_server(self):
+        def server_loop():
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.bind(('', self.port))
+            server_socket.listen(50)
+            print(f"Peer {self.peer_id} is listening on port {self.port}")
+            while True:
+                client_socket, _ = server_socket.accept()
+                threading.Thread(target=self.handle_newly_accepted_connection, args=(client_socket,), daemon=True).start()
+                
+        threading.Thread(target=server_loop, daemon=True).start()
+
+    def handle_newly_accepted_connection(self, client_socket):
+        try:
+            remote_peer_id = self.perform_handshake(client_socket)
+            self.logger.create_log(f"TCP connection is built between P{remote_peer_id} and P{self.peer_id}")
+            
+            remote_id = int(remote_peer_id)
+            self.neighbor_sockets[remote_id] = client_socket
+            
+            handler = PeerConnectionHandler(client_socket, remote_id, self)
+            self.client_handlers[remote_id] = handler
+            self.peer_completion_map[remote_id] = False
+            
+            handler.start()
+        except Exception as e:
+            print(f"Error handling incoming connection: {e}")
+
+    def connect_to_peers(self):
+        for peer_info in self.peers_info.values():
+            if peer_info.id == int(self.peer_id):
+                break
+                
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((peer_info.host_name, peer_info.port_number))
+                self.perform_handshake(sock)
+                
+                self.logger.create_log(f"TCP connection is built between P{self.peer_id} and P{peer_info.id}")
+                self.neighbor_sockets[peer_info.id] = sock
+                
+                handler = PeerConnectionHandler(sock, peer_info.id, self)
+                self.client_handlers[peer_info.id] = handler
+                self.peer_completion_map[peer_info.id] = False
+                
+                handler.start()
+            except Exception as e:
+                print(f"Error connecting to peer {peer_info.id}: {e}")
+
+    def perform_handshake(self, sock):
+        header = b"P2PFILESHARINGPROJ"
+        zero_bits = bytes(10)
+        peer_id_bytes = struct.pack(">I", int(self.peer_id))
+        
+        handshake_msg = header + zero_bits + peer_id_bytes
+        sock.sendall(handshake_msg)
+        self.logger.create_log(f"Peer [{self.peer_id}] sent handshake to the remote peer.")
+        
+        received_handshake = bytearray()
+        while len(received_handshake) < 32:
+            packet = sock.recv(32 - len(received_handshake))
+            if not packet:
+                raise ConnectionError("Stream closed during handshake")
+            received_handshake.extend(packet)
+            
+        received_header = received_handshake[:18]
+        if received_header != b"P2PFILESHARINGPROJ":
+            raise ValueError("Invalid handshake header")
+            
+        remote_peer_id = struct.unpack(">I", received_handshake[28:32])[0]
+        self.logger.create_log(f"Peer [{self.peer_id}] received valid handshake from Peer [{remote_peer_id}].")
+        
+        return str(remote_peer_id)
+
+    def schedule_unchoking(self):
+        while True:
+            time.sleep(self.unchoking_interval)
+            self.update_preferred_neighbors()
+
+    def schedule_optimistic_unchoking(self):
+        while True:
+            time.sleep(self.optimistic_unchoking_interval)
+            self.optimistically_unchoke_neighbor()
+
+    def update_preferred_neighbors(self):
+        try:
+            interested_neighbors = []
+            for handler in self.client_handlers.values():
+                if handler.is_interested():
+                    interested_neighbors.append(handler.get_remote_peer_id())
+                    
+            if not interested_neighbors:
+                self.preferred_neighbors.clear()
+                self.logger.create_log(f"Peer [{self.peer_id}] has no interested neighbors.")
+                return
+                
+            self.logger.create_log(f"Every {self.unchoking_interval} seconds, Peer [{self.peer_id}] recalculates preferred neighbors and sends CHOKE/UNCHOKE messages.")
+            
+            if self.has_complete_file():
+                random.shuffle(interested_neighbors)
+                self.preferred_neighbors = set(interested_neighbors[:self.number_of_preferred_neighbors])
+            else:
+                sorted_neighbors = sorted(interested_neighbors, 
+                                          key=lambda pid: self.client_handlers[pid].get_track_download_rate(), 
+                                          reverse=True)
+                self.preferred_neighbors = set(sorted_neighbors[:self.number_of_preferred_neighbors])
+                
+            for handler in self.client_handlers.values():
+                remote_id = handler.get_remote_peer_id()
+                if remote_id in self.preferred_neighbors:
+                    if handler.is_choked():  # only send unchoke if currently choked (avoid duplicate)
+                        handler.send_unchoke()
+                else:
+                    if not handler.is_choked():  # only send choke if currently unchoked
+                        handler.send_choke()
+                        
+            neighbor_list = ", ".join(map(str, self.preferred_neighbors))
+            self.logger.create_log(f"Peer [{self.peer_id}] has the preferred neighbors [{neighbor_list}].")
+            
+        except Exception as e:
+            print(f"Error updating preferred neighbors: {e}")
+
+    def optimistically_unchoke_neighbor(self):
+        try:
+            candidates = []
+            for handler in self.client_handlers.values():
+                if handler.is_interested() and handler.is_choked() and handler.get_remote_peer_id() not in self.preferred_neighbors:
+                    candidates.append(handler.get_remote_peer_id())
+                    
+            if not candidates:
+                return
+                
+            selected_peer_id = random.choice(candidates)
+            self.optimistic_unchoked_neighbor = selected_peer_id
+            
+            self.client_handlers[selected_peer_id].send_unchoke()
+            self.logger.create_log(f"Peer [{self.peer_id}] has the optimistically unchoked neighbor [{self.optimistic_unchoked_neighbor}].")
+            
+        except Exception as e:
+            print(f"Error in optimistically unchoking neighbor: {e}")
+
+    def has_piece(self, piece_index):
+        with self.bitfield_lock:
+            byte_index = piece_index // 8
+            bit_index = 7 - (piece_index % 8)
+            return (self.bitfield[byte_index] & (1 << bit_index)) != 0
+
+    def get_bitfield(self):
+        with self.bitfield_lock:
+            return bytearray(self.bitfield)
+
+    def update_bitfield(self, piece_index):
+        with self.bitfield_lock:
+            byte_index = piece_index // 8
+            bit_index = 7 - (piece_index % 8)
+            self.bitfield[byte_index] |= (1 << bit_index)
+
+    def is_completed(self):
+        for i in range(self.total_pieces):
+            if not self.has_piece(i):
+                return False
+        return True
+
+    def check_and_set_completion(self):
+        with self.completion_lock:
+            if self.is_completed() and not self._has_complete_file:
+                self._has_complete_file = True
+                self.logger.create_log(f"Peer [{self.peer_id}] has downloaded the complete file.")
+                self.logger.create_log(f"Peer [{self.peer_id}] is reassembling {self.total_pieces} pieces into '{self.file_name}'.")
+                try:
+                    self.merge_file_pieces()
+                    self.logger.create_log(f"Peer [{self.peer_id}] successfully wrote '{self.file_name}' to disk.")
+                except Exception as e:
+                    print(f"Error merging file pieces: {e}")
+
+    def merge_file_pieces(self):
+        output_file_path = os.path.join(self.peer_directory, self.file_name)
+        with open(output_file_path, "wb") as fos:
+            for i in range(self.total_pieces):
+                piece_path = os.path.join(self.peer_directory, f"piece_{i}")
+                with open(piece_path, "rb") as fis:
+                    fos.write(fis.read())
+
+    def split_file_into_pieces(self, input_file_path):
+        with open(input_file_path, "rb") as fis:
+            piece_index = 0
+            while True:
+                data = fis.read(self.piece_size)
+                if not data:
+                    break
+                piece_path = os.path.join(self.peer_directory, f"piece_{piece_index}")
+                with open(piece_path, "wb") as fos:
+                    fos.write(data)
+                piece_index += 1
+        self.logger.create_log(f"Peer [{self.peer_id}] has split the file into {piece_index} pieces.")
+
+    def check_completion(self):
+        while True:
+            try:
+                if len(self.peer_completion_map) < len(self.peers_info) - 1:
+                    time.sleep(2)
+                    continue
+                    
+                if self.has_complete_file():
+                    all_complete = True
+                    for pid, is_complete in self.peer_completion_map.items():
+                        if not is_complete:
+                            all_complete = False
+                            break
+                            
+                    if all_complete:
+                        self.logger.create_log(
+                            f"Peer [{self.peer_id}] detects that all peers have the complete file. "
+                            f"Shutting down gracefully."
+                        )
+                        # close all neighbor sockets cleanly before exit
+                        for sock in list(self.neighbor_sockets.values()):
+                            try:
+                                sock.close()
+                            except Exception:
+                                pass
+                        time.sleep(1)
+                        os._exit(0)
+                        
+                time.sleep(2)
+            except Exception as e:
+                print(f"Error in completion checker: {e}")
+                time.sleep(2)
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        print("Usage: python peer.py <peerID>")
+        sys.exit(1)
+    
+    peer_id = sys.argv[1]
+    peer = Peer(peer_id)
+    peer.start()

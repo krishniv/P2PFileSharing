@@ -118,10 +118,15 @@ class PeerConnectionHandler(threading.Thread):
         self.track_download_rate += 1
         self.total_bytes_received += len(piece_data)
         
-        self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] has downloaded the piece [{piece_index}] from [{self.remote_peer_id}]. Now the number of pieces it has is [{self.get_number_of_pieces()}].")
-        self.peer.get_logger().create_log(f"Total bytes received so far: {self.total_bytes_received} bytes.")
+        num_pieces = self.get_number_of_pieces()
+        self.peer.get_logger().create_log(
+            f"Peer [{self.peer.get_peer_id()}] has downloaded the piece [{piece_index}] from "
+            f"[{self.remote_peer_id}]. Now the number of pieces it has is [{num_pieces}]."
+        )
         
-        self.request_piece()
+        # Request next piece if not yet complete
+        if not self.peer.has_complete_file():
+            self.request_piece()
 
     def handle_have_message(self, payload):
         piece_index = struct.unpack(">I", payload[:4])[0]
@@ -130,8 +135,19 @@ class PeerConnectionHandler(threading.Thread):
         self.peer.get_logger().create_log(f"Peer [{self.peer.get_peer_id()}] received the 'have' message from [{self.remote_peer_id}] for the piece [{piece_index}].")
         
         if not self.peer.has_piece(piece_index):
-            self.send_interested()
-            self.interested = True
+            # We don't have this piece, so we're interested
+            if not self.interested:
+                self.send_interested()
+                self.interested = True
+        else:
+            # We already have this piece — check if there's anything else we need from remote
+            still_interested = any(
+                not self.peer.has_piece(i) and self.has_piece(i)
+                for i in range(self.peer.get_total_pieces())
+            )
+            if not still_interested and self.interested:
+                self.send_not_interested()
+                self.interested = False
             
         if self.get_remote_peers_piece_count() == self.peer.get_total_pieces():
             self.peer.mark_peer_complete(self.remote_peer_id)

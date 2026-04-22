@@ -1,33 +1,23 @@
-# Python
+# Python cache
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-*.pyd
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
 
-# Virtual environments
-venv/
-.venv/
-env/
-.env/
+# Generated log files
+log_peer_*.log
 
-# Logs
-*.log
+# Old output files
+peer1_out.txt
+peer2_out.txt
+peer3_out.txt
 
-# Peer data directories (auto-generated)
-peer_*/
+# Auto-generated piece files (recreated on each run)
+peer_1001/piece_*
 
-# OS
-.DS_Store
-Thumbs.db
+# Peer 1002 and 1003 working directories (empty on start, filled at runtime)
+peer_1002/*
+peer_1003/*
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# Keep the empty directories tracked by git
+!peer_1002/.gitkeep
+!peer_1003/.gitkeep
