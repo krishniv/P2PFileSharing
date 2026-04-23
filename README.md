@@ -2,7 +2,7 @@
 
 ## Video Demo
 
-**Video URL:** `[INSERT YOUR ONEDRIVE/CANVAS VIDEO URL HERE]`
+**Video URL:** `[https://drive.google.com/drive/folders/12n8eyTbY7l5lKKYC5u7pRN8dXmEQUBYe?usp=sharing]`
 
 > The video demonstrates all features as listed in the project rubric, including config parsing,
 > TCP connection setup, handshake, bitfield, choke/unchoke, optimistic unchoking, and file assembly.
@@ -16,8 +16,8 @@
 | Member | Contributions |
 |--------|--------------|
 | Satvik (49893400)| Core peer logic (`peer.py`), handshake implementation, preferred neighbor selection (choke/unchoke), optimistic unchoking scheduler, completion detection and shutdown logic |
-| Bhumi Jain | Message handling (`message.py`, `peer_connection_handler.py`), bitfield exchange, request/have/piece message processing, file piece assembly |
-| Krishna | Configuration parsing (`peer_config.py`, `Common.cfg`, `PeerInfo.cfg` reading), logging infrastructure (`logger.py`), testing and debugging |
+| Bhumi Jain (73961370) | Message handling (`message.py`, `peer_connection_handler.py`), bitfield exchange, request/have/piece message processing, file piece assembly |
+| Krishna(63557608) | Configuration parsing (`peer_config.py`, `Common.cfg`, `PeerInfo.cfg` reading), logging infrastructure (`logger.py`), testing and debugging |
 
 ---
 
