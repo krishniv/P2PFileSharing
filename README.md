@@ -15,7 +15,7 @@
 
 | Member | Contributions |
 |--------|--------------|
-| Satvik | Core peer logic (`peer.py`), handshake implementation, preferred neighbor selection (choke/unchoke), optimistic unchoking scheduler, completion detection and shutdown logic |
+| Satvik (49893400)| Core peer logic (`peer.py`), handshake implementation, preferred neighbor selection (choke/unchoke), optimistic unchoking scheduler, completion detection and shutdown logic |
 | Bhumi Jain | Message handling (`message.py`, `peer_connection_handler.py`), bitfield exchange, request/have/piece message processing, file piece assembly |
 | Krishna | Configuration parsing (`peer_config.py`, `Common.cfg`, `PeerInfo.cfg` reading), logging infrastructure (`logger.py`), testing and debugging |
 
@@ -25,22 +25,7 @@
 
 This project implements a decentralized **Peer-to-Peer (P2P) File Sharing System** modeled after BitTorrent. Multiple peers exchange file pieces over TCP connections, using choking/unchoking algorithms to optimize bandwidth and promote fairness.
 
-### Implemented Features (Rubric Coverage)
 
-| Rubric Item | Status |
-|-------------|--------|
-| Reads `Common.cfg` / `PeerInfo.cfg` on startup | ✅ |
-| Each peer connects via TCP to all prior peers | ✅ |
-| Peer terminates when ALL peers have complete file | ✅ |
-| Handshake message on every connection | ✅ |
-| Bitfield exchange after handshake | ✅ |
-| Interested / Not Interested messages | ✅ |
-| k preferred neighbors unchoked every p seconds | ✅ |
-| Optimistically unchoked neighbor every m seconds | ✅ |
-| Request / Have / Piece message exchange | ✅ |
-| Bitfield updated on receiving 'have' | ✅ |
-| File reassembled from pieces after download | ✅ |
-| Graceful shutdown after all peers complete | ✅ |
 
 ---
 
